@@ -2,5 +2,5 @@ package.json
 src/lib/redirects
 src/lib/revalidate
 src/pages/api/redirects
-src/pages/api/revalidate
+src/pages/api/revalidate.ts
 src/lib/middleware/plugins/redirects.ts
