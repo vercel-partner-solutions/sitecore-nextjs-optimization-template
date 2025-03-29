@@ -136,6 +136,7 @@ const NavigationList = (props: NavigationProps) => {
           field={getLinkField(props)}
           editable={sitecoreContext.pageEditing}
           onClick={props.handleClick}
+          prefetch={false}
         >
           {getNavigationText(props)}
         </Link>

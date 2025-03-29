@@ -84,7 +84,7 @@ export const Default = (props: TitleProps): JSX.Element => {
         {sitecoreContext.pageEditing ? (
           <Text field={text} />
         ) : (
-          <Link field={link}>
+          <Link field={link} prefetch={false}>
             <Text field={text} />
           </Link>
         )}
