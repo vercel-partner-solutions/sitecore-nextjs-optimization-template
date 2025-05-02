@@ -2,9 +2,9 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import clientFactory from "lib/graphql-client-factory"
 import { siteResolver } from "lib/site-resolver"
 import { GraphQLRedirectsService } from "@sitecore-jss/sitecore-jss/site"
-import getConfig from "next/config"
-import { hashPath, updateEdgeConfig } from "./utils"
-import { createClient } from "@vercel/edge-config"
+import nextConfig from "next.config"
+import { updateEdgeConfig } from "./utils"
+import { createBloomFilter } from "./simple-bloom-filter"
 
 export async function handler(_request: NextApiRequest, response: NextApiResponse) {
   // 1. Environment validation
@@ -14,70 +14,55 @@ export async function handler(_request: NextApiRequest, response: NextApiRespons
     !process.env.EDGE_CONFIG_VERCEL_TOKEN
   ) {
     return response.status(500).json({
-      error: "Environment variables for Vercel Edge Config are not set",
-    })
+      error: 'Environment variables for Vercel Edge Config are not set',
+    });
   }
 
-  // 2. Authentication - Skipped for demo purposes
-  // if (request.headers["sc-redirect-publish-webhook-key"] !== process.env.SITECORE_WEBHOOK_KEY) {
-  //   return response.status(401).json({ error: "Unauthorized" })
+  // 2. Authentication - Commented out for demo purposes
+  // if (request.headers['sc-redirect-publish-webhook-key'] !== process.env.SITECORE_WEBHOOK_KEY) {
+  //  return response.status(401).json({ error: 'Unauthorized' });
   // }
 
   try {
     // 3. Service configuration
     const config = {
       clientFactory,
-      locales: getConfig().publicRuntimeConfig.i18n,
+      locales: nextConfig().i18n,
       excludeRoute: () => false,
       siteResolver,
-    }
+    };
 
     // 4. Fetch redirects from Sitecore
-    const redirectsService = new GraphQLRedirectsService({ ...config, fetch: fetch })
-    const redirects = await redirectsService.fetchRedirects(process.env.SITECORE_SITE_NAME)
+    const redirectsService = new GraphQLRedirectsService({ ...config, fetch: fetch });
+    const redirects = await redirectsService.fetchRedirects(process.env.SITECORE_SITE_NAME);
 
-    // 5. Get all existing Edge Config redirects
-    const edgeConfigClient = createClient(process.env.EDGE_CONFIG)
-    const edgeConfig = await edgeConfigClient.getAll()
-    const existingKeys = Object.keys(edgeConfig || {})
+    // 5. Create bloom filter using the pathname as the key
+    const bloomFilter = createBloomFilter(
+      redirects.map((r) => r.pattern.split('?')[0].replace(/\/+$/, ''))
+    );
 
-    // 6. Create new Edge Config redirect items
-    const edgeConfigRedirectItems = await Promise.all(
-      redirects.map(async (redirect) => {
-        // Remove query string and trailing slash to match middleware path
-        // Note with this solution regex redirects should be moved to next.config.js
-        const cleanPattern = redirect.pattern.split("?")[0].replace(/\/+$/, "")
-        // Edge config requires alphanumeric keys so hashing is required
-        const redirectKey = await hashPath(cleanPattern)
-        return {
-          operation: "upsert",
-          key: `${process.env.SITECORE_SITE_NAME}_${redirectKey}`,
-          value: JSON.stringify(redirect),
-        }
-      }),
-    )
+    // 6. Update Edge Config with the bloom filter
+    const result = await updateEdgeConfig(
+      [
+        {
+          operation: 'upsert',
+          key: `${process.env.SITECORE_SITE_NAME}`,
+          value: JSON.stringify(bloomFilter),
+        },
+      ],
+      {
+        endpoint: process.env.EDGE_CONFIG_ENDPOINT,
+        token: process.env.EDGE_CONFIG_VERCEL_TOKEN,
+        siteName: process.env.SITECORE_SITE_NAME,
+      }
+    );
 
-    // 7. Filter out items that already exist in edge config
-    const newItems = edgeConfigRedirectItems.filter((item) => !existingKeys.some((key) => key === item.key))
-
-    // 8. Filter out items that no longer exist in Sitecore
-    const removedItems = existingKeys
-      .filter((key) => !edgeConfigRedirectItems.some((redirect) => redirect.key === key))
-      .map((key) => ({
-        operation: "delete",
-        key: key,
-      }))
-
-    const result = await updateEdgeConfig([...newItems, ...removedItems], {
-      endpoint: process.env.EDGE_CONFIG_ENDPOINT,
-      token: process.env.EDGE_CONFIG_VERCEL_TOKEN,
-      siteName: process.env.SITECORE_SITE_NAME,
-    })
-
-    return response.status(200).send(result)
+    if (!result.success) {
+      return response.status(500).json({ error: 'Error updating Edge Config' });
+    }
+    return response.status(200).send(result);
   } catch (error) {
-    console.error(error)
-    response.status(500).json({ error: "Error updating Edge Config" })
+    console.error(error);
+    response.status(500).json({ error: 'Error updating Edge Config' });
   }
 }
-
