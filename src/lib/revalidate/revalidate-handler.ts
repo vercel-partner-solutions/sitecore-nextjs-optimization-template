@@ -76,7 +76,7 @@ export const handler = async (req: NextApiRequest, res: NextApiResponse) => {
     console.error('Revalidation error:', error);
     return res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error occurred',
+      error: error instanceof Error ? error.message : 'Unknown error occurred.',
     });
   }
 };
