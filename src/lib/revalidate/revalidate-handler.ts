@@ -2,7 +2,29 @@ import { GraphQLLayoutService } from '@sitecore-jss/sitecore-jss-nextjs';
 import { createGraphQLClientFactory } from 'lib/graphql-client-factory/create';
 import { NextApiRequest, NextApiResponse } from 'next';
 
-type UpdatedItem = {
+interface WebhookUpdate {
+  entity_definition?: string;
+  identifier?: string;
+}
+
+interface WebhookPayload {
+  updates?: WebhookUpdate[];
+}
+
+interface GraphQLItemResponse {
+  item?: {
+    id?: string;
+    template?: {
+      id?: string;
+      name?: string;
+    };
+    url?: {
+      path?: string;
+    };
+  } | null;
+}
+
+interface UpdatedItem {
   item: {
     id: string;
     template: {
@@ -13,64 +35,161 @@ type UpdatedItem = {
       path: string;
     };
   };
-};
+}
 
 class GraphQLRevalidationService extends GraphQLLayoutService {
-  async getItems(id: string) {
+  async getItems(id: string): Promise<GraphQLItemResponse> {
+    if (!id?.trim()) {
+      throw new Error('Item identifier is required');
+    }
+    
+    const sanitizedId = id.replace(/['"\\]/g, '');
+    
     const query = `
     query { 
-      item(path: "${id}", language: "en") {
+      item(path: "${sanitizedId}", language: "en") {
         id
         template {
           id
           name
         }
         url {
-        path
+          path
+        }
       }
+    }`;
+    
+    try {
+      return await this.getGraphQLClient().request<GraphQLItemResponse>(query);
+    } catch (error) {
+      console.error(`Failed to fetch item with id ${id}:`, error);
+      throw error;
     }
-  }`;
-    return await this.getGraphQLClient().request(query);
   }
 }
 
 export const handler = async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== "POST") {
-    return res.status(405).json({ message: "Method not allowed" })
+    return res.status(405).json({ message: "Method not allowed" });
+  }
+
+  // Environment validation
+  if (!process.env.SITECORE_SITE_NAME || !process.env.SITECORE_EDGE_CONTEXT_ID) {
+    console.error('Missing required environment variables: SITECORE_SITE_NAME, SITECORE_EDGE_CONTEXT_ID');
+    return res.status(500).json({
+      success: false,
+      error: 'Server configuration error',
+    });
   }
   
   try {
-    const data = req.body;
+    const data = req.body as WebhookPayload;
+
+    // Validate request payload
+    if (!data || !Array.isArray(data.updates)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid webhook payload: updates array is required',
+      });
+    }
+
+    if (data.updates.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'No updates to process',
+      });
+    }
 
     // Initialize GraphQL service for fetching item data
     const service = new GraphQLRevalidationService({
-      siteName: process.env.SITECORE_SITE_NAME || '',
+      siteName: process.env.SITECORE_SITE_NAME,
       clientFactory: createGraphQLClientFactory({
-        sitecoreEdgeContextId: process.env.SITECORE_EDGE_CONTEXT_ID!,
+        sitecoreEdgeContextId: process.env.SITECORE_EDGE_CONTEXT_ID,
       }),
     });
 
-    // Filter for Item updates and fetch their details
-    const getItemPromises = data.updates
-      .filter((update: { entity_definition: string }) => update.entity_definition === 'Item')
-      .map((update: { identifier: string }) => service.getItems(update.identifier));
+    // Filter for Item updates and validate identifiers
+    const validUpdates = data.updates
+      .filter((update): update is Required<WebhookUpdate> => 
+        update?.entity_definition === 'Item' && 
+        typeof update.identifier === 'string' && 
+        update.identifier.trim().length > 0
+      );
 
-    const updatedItems = await Promise.all(getItemPromises);
+    if (validUpdates.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'No valid item updates to process',
+      });
+    }
 
-    // Filter for only Page template items
-    const updatedPages = updatedItems.filter(
-      (updatedItem: UpdatedItem) => updatedItem.item.template.name === 'Page'
-    );
-
-    // Revalidate each updated page
-    const revalidatePromises = updatedPages.map((page) => {
-      return res.revalidate(page.item.url.path);
+    // Fetch item details with individual error handling
+    const itemPromises = validUpdates.map(async (update) => {
+      try {
+        const result = await service.getItems(update.identifier);
+        return result;
+      } catch (error) {
+        console.error(`Failed to fetch item ${update.identifier}:`, error);
+        return null;
+      }
     });
 
-    await Promise.all(revalidatePromises);
+    const updatedItems = await Promise.all(itemPromises);
+
+    // Filter for valid responses and Page template items
+    const validPages: UpdatedItem[] = updatedItems
+      .filter((item): item is NonNullable<GraphQLItemResponse> => 
+        item?.item != null
+      )
+      .filter((item): item is UpdatedItem => {
+        const { item: itemData } = item;
+        return (
+          itemData?.id != null &&
+          itemData?.template?.name === 'Page' &&
+          itemData?.url?.path != null &&
+          typeof itemData.url.path === 'string' &&
+          itemData.url.path.trim().length > 0
+        );
+      });
+
+    if (validPages.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'No valid pages found to revalidate',
+      });
+    }
+
+    // Revalidate each page with individual error handling
+    const revalidateResults = await Promise.allSettled(
+      validPages.map(async (page) => {
+        try {
+          await res.revalidate(page.item.url.path);
+          return { success: true, path: page.item.url.path };
+        } catch (error) {
+          console.error(`Failed to revalidate path ${page.item.url.path}:`, error);
+          return { 
+            success: false, 
+            path: page.item.url.path, 
+            error: error instanceof Error ? error.message : 'Unknown revalidation error' 
+          };
+        }
+      })
+    );
+
+    const successful = revalidateResults.filter((result) => 
+      result.status === 'fulfilled' && result.value.success
+    ).length;
+
+    const failed = revalidateResults.length - successful;
 
     return res.status(200).json({
       success: true,
+      message: `Revalidation completed: ${successful} successful, ${failed} failed`,
+      details: {
+        total: revalidateResults.length,
+        successful,
+        failed,
+      },
     });
   } catch (error) {
     console.error('Revalidation error:', error);
