@@ -84,6 +84,13 @@ export const getStaticPaths: GetStaticPaths = async (context) => {
 export const getStaticProps: GetStaticProps = async (context) => {
   const props = await sitecorePagePropsFactory.create(context);
   console.log(JSON.stringify(props), JSON.stringify(context));
+  // If data is 404, return notFound immediately
+  if (props.notFound) {
+    return {
+      notFound: true,
+      revalidate: 1, // Force quick revalidation for 404s
+    }
+  }
   return {
     props,
     // Next.js will attempt to re-generate the page:
