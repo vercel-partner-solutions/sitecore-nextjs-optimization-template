@@ -89,7 +89,7 @@ export const getStaticProps: GetStaticProps = async (context) => {
     return {
       notFound: true,
       revalidate: 1, // Force quick revalidation for 404s
-    }
+    };
   }
   return {
     props,
